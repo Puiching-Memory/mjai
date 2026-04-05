@@ -1,6 +1,7 @@
 use std::env;
 use std::fs;
 use std::io::{self, BufRead, Write};
+use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -27,7 +28,7 @@ struct InferenceResponse {
     masked_logits: Vec<f32>,
 }
 
-fn load_model(model_path: &str) -> Result<SimplePlan<TypedFact, Box<dyn TypedOp>, Graph<TypedFact, Box<dyn TypedOp>>>> {
+fn load_model(model_path: &str) -> Result<Arc<TypedRunnableModel>> {
     tract_onnx::onnx()
         .model_for_path(model_path)
         .with_context(|| format!("failed to load ONNX model at {model_path}"))?
@@ -111,7 +112,7 @@ fn main() -> Result<()> {
         let input = Tensor::from(input);
         let result = model.run(tvec!(input.into()))?;
         let logits = result[0]
-            .to_array_view::<f32>()
+            .to_dense_array_view::<f32>()
             .context("tract returned a non-f32 logits tensor")?
             .iter()
             .copied()

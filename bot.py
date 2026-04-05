@@ -26,7 +26,11 @@ from train.inference_spec import (
 )
 
 logger.remove()
-logger.add(sys.stderr, format="<green>{time:HH:mm:ss}</green> <level>{level} {message}</level>")  # noqa
+logger.add(
+    sys.stderr,
+    level=os.environ.get("MJAI_LOG_LEVEL", "INFO").upper(),
+    format="<green>{time:HH:mm:ss}</green> <level>{level} {message}</level>",
+)  # noqa
 
 HONOR_TILES = {"E", "S", "W", "N", "P", "F", "C"}
 WIND_TILES = ["E", "S", "W", "N"]

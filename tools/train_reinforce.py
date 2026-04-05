@@ -3,16 +3,18 @@ from __future__ import annotations
 import argparse
 from dataclasses import asdict
 import json
+import os
 import random
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import torch
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+os.environ.setdefault("MJAI_LOG_LEVEL", "WARNING")
 
 from train.checkpoints import (
     build_model_from_checkpoint,
@@ -23,6 +25,7 @@ from train.checkpoints import (
 from train.evaluation import evaluate_policy_paths
 from train.self_play import PolicyMatchSpec, flatten_training_examples, run_match_series, summarize_matches
 from train.training_config import EvaluationConfig, OptimizerConfig, RewardConfig, SelfPlayConfig, SupervisedPretrainConfig
+from train.training_ui import TrainingDashboard, resolve_rich_logging
 
 
 def parse_args() -> argparse.Namespace:
@@ -32,6 +35,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", type=Path, default=Path("artifacts/policy.pt"), help="Training checkpoint path.")
     parser.add_argument("--best-checkpoint", type=Path, default=Path("artifacts/policy.best.pt"), help="Best checkpoint path.")
     parser.add_argument("--metrics-jsonl", type=Path, default=Path("artifacts/training_metrics.jsonl"), help="Metrics JSONL output.")
+    parser.add_argument("--log-format", choices=("auto", "rich", "json"), default="auto", help="Stdout logging format.")
     parser.add_argument("--iterations", type=int, default=10, help="Number of training iterations.")
     parser.add_argument("--matches-per-iteration", type=int, default=8, help="Self-play matches per iteration.")
     parser.add_argument("--workers", type=int, default=1, help="CPU self-play worker count.")
@@ -101,6 +105,7 @@ def train_policy_iteration(
     epochs_per_iteration: int,
     entropy_coef: float,
     grad_clip_norm: float,
+    progress_callback: Callable[[int, int, float, float], None] | None = None,
 ) -> dict[str, float]:
     features = torch.tensor([example["features"] for example in examples], dtype=torch.float32)
     legal_masks = torch.tensor([example["legal_actions"] for example in examples], dtype=torch.bool)
@@ -117,6 +122,9 @@ def train_policy_iteration(
     entropies: list[float] = []
 
     sample_count = features.shape[0]
+    batches_per_epoch = max(1, (sample_count + minibatch_size - 1) // minibatch_size)
+    total_batches = epochs_per_iteration * batches_per_epoch
+    completed_batches = 0
     for _ in range(epochs_per_iteration):
         indices = torch.randperm(sample_count, device=device)
         for start in range(0, sample_count, minibatch_size):
@@ -141,6 +149,9 @@ def train_policy_iteration(
 
             losses.append(float(loss.detach().cpu().item()))
             entropies.append(float(entropy.mean().detach().cpu().item()))
+            completed_batches += 1
+            if progress_callback is not None:
+                progress_callback(completed_batches, total_batches, losses[-1], entropies[-1])
 
     model.eval()
     return {
@@ -206,6 +217,7 @@ def main() -> None:
         matches=args.evaluation_matches,
         workers=args.workers,
     )
+    rich_logging = resolve_rich_logging(args.log_format)
 
     model, config, payload = build_model_from_checkpoint(checkpoint_path, device=learner_device)
     optimizer = torch.optim.AdamW(
@@ -220,89 +232,145 @@ def main() -> None:
     if not args.best_checkpoint.exists():
         copy_checkpoint(checkpoint_path, args.best_checkpoint)
 
-    for iteration in range(1, args.iterations + 1):
-        current_seed = self_play_config.seed + iteration * 1000
-        match_specs = expand_selfplay_specs(
-            checkpoint_path,
-            matches=self_play_config.matches_per_iteration,
-            temperature=self_play_config.temperature,
-        )
-        match_results = run_match_series(
-            match_specs,
-            reward_config=reward_config,
-            workers=self_play_config.workers,
-            seed=current_seed,
-        )
-        self_play_summary = summarize_matches(match_results)
-        examples = flatten_training_examples(match_results, policy_name="candidate")
-        if not examples:
-            raise RuntimeError("self-play produced no training examples")
+    dashboard = TrainingDashboard(
+        enabled=rich_logging,
+        total_iterations=args.iterations,
+        device=optimizer_config.device,
+        checkpoint_path=checkpoint_path,
+        best_checkpoint_path=args.best_checkpoint,
+        metrics_path=args.metrics_jsonl,
+    )
 
-        train_metrics = train_policy_iteration(
-            model,
-            examples=examples,
-            optimizer=optimizer,
-            device=optimizer_config.device,
-            minibatch_size=optimizer_config.minibatch_size,
-            epochs_per_iteration=optimizer_config.epochs_per_iteration,
-            entropy_coef=optimizer_config.entropy_coef,
-            grad_clip_norm=optimizer_config.grad_clip_norm,
-        )
+    with dashboard:
+        for iteration in range(1, args.iterations + 1):
+            current_seed = self_play_config.seed + iteration * 1000
+            dashboard.start_iteration(run_iteration=iteration, checkpoint_step=step + 1)
 
-        step += 1
-        latest_metrics = {
-            "iteration": step,
-            "self_play": {
-                key: asdict(value)
-                for key, value in self_play_summary.items()
-            },
-            "train": train_metrics,
-            "examples": len(examples),
-            "device": optimizer_config.device,
-        }
-        save_checkpoint(
-            checkpoint_path,
-            model=model,
-            config=config,
-            step=step,
-            optimizer_state_dict=optimizer.state_dict(),
-            metrics=latest_metrics,
-        )
-
-        evaluation = evaluate_policy_paths(
-            candidate_checkpoint=checkpoint_path,
-            baseline_checkpoint=args.best_checkpoint,
-            matches=evaluation_config.matches,
-            workers=evaluation_config.workers,
-            seed=current_seed + 500,
-            deterministic=evaluation_config.deterministic,
-            reward_config=reward_config,
-        )
-        improved = candidate_is_better(evaluation)
-        if improved:
-            copy_checkpoint(checkpoint_path, args.best_checkpoint)
-
-        metrics_row = {
-            **latest_metrics,
-            "evaluation": evaluation["metrics"],
-            "improved": improved,
-        }
-        append_metrics(args.metrics_jsonl, metrics_row)
-
-        print(
-            json.dumps(
-                {
-                    "iteration": step,
-                    "examples": len(examples),
-                    "loss": train_metrics["loss"],
-                    "entropy": train_metrics["entropy"],
-                    "candidate_eval": evaluation["metrics"].get("candidate"),
-                    "baseline_eval": evaluation["metrics"].get("baseline"),
-                    "improved": improved,
-                },
-                ensure_ascii=True,
+            match_specs = expand_selfplay_specs(
+                checkpoint_path,
+                matches=self_play_config.matches_per_iteration,
+                temperature=self_play_config.temperature,
             )
-        )
+            dashboard.set_phase(
+                "self-play",
+                total=len(match_specs),
+                completed=0,
+                detail=f"seed {current_seed}",
+            )
+            match_results = run_match_series(
+                match_specs,
+                reward_config=reward_config,
+                workers=self_play_config.workers,
+                seed=current_seed,
+                progress_callback=dashboard.update_phase_progress if rich_logging else None,
+            )
+            self_play_summary = summarize_matches(match_results)
+            examples = flatten_training_examples(match_results, policy_name="candidate")
+            if not examples:
+                raise RuntimeError("self-play produced no training examples")
+            dashboard.record_self_play(
+                {
+                    key: asdict(value)
+                    for key, value in self_play_summary.items()
+                },
+                len(examples),
+            )
+
+            batch_count = optimizer_config.epochs_per_iteration * max(
+                1,
+                (len(examples) + optimizer_config.minibatch_size - 1) // optimizer_config.minibatch_size,
+            )
+            dashboard.set_phase(
+                "optimize",
+                total=batch_count,
+                completed=0,
+                detail=f"{len(examples)} examples",
+            )
+            train_metrics = train_policy_iteration(
+                model,
+                examples=examples,
+                optimizer=optimizer,
+                device=optimizer_config.device,
+                minibatch_size=optimizer_config.minibatch_size,
+                epochs_per_iteration=optimizer_config.epochs_per_iteration,
+                entropy_coef=optimizer_config.entropy_coef,
+                grad_clip_norm=optimizer_config.grad_clip_norm,
+                progress_callback=(
+                    lambda completed, total, loss, entropy: dashboard.update_phase_progress(
+                        completed,
+                        total,
+                        detail=f"loss {loss:.4f} entropy {entropy:.4f}",
+                    )
+                )
+                if rich_logging
+                else None,
+            )
+            dashboard.record_train(train_metrics)
+
+            step += 1
+            latest_metrics = {
+                "iteration": step,
+                "self_play": {
+                    key: asdict(value)
+                    for key, value in self_play_summary.items()
+                },
+                "train": train_metrics,
+                "examples": len(examples),
+                "device": optimizer_config.device,
+            }
+            save_checkpoint(
+                checkpoint_path,
+                model=model,
+                config=config,
+                step=step,
+                optimizer_state_dict=optimizer.state_dict(),
+                metrics=latest_metrics,
+            )
+
+            dashboard.set_phase(
+                "evaluation",
+                total=evaluation_config.matches,
+                completed=0,
+                detail=args.best_checkpoint.name,
+            )
+            evaluation = evaluate_policy_paths(
+                candidate_checkpoint=checkpoint_path,
+                baseline_checkpoint=args.best_checkpoint,
+                matches=evaluation_config.matches,
+                workers=evaluation_config.workers,
+                seed=current_seed + 500,
+                deterministic=evaluation_config.deterministic,
+                reward_config=reward_config,
+                progress_callback=dashboard.update_phase_progress if rich_logging else None,
+            )
+            improved = candidate_is_better(evaluation)
+            if improved:
+                copy_checkpoint(checkpoint_path, args.best_checkpoint)
+            dashboard.record_evaluation(evaluation["metrics"], improved)
+
+            metrics_row = {
+                **latest_metrics,
+                "evaluation": evaluation["metrics"],
+                "improved": improved,
+            }
+            append_metrics(args.metrics_jsonl, metrics_row)
+            dashboard.record_iteration_history(metrics_row)
+
+            stdout_payload = {
+                "iteration": step,
+                "examples": len(examples),
+                "loss": train_metrics["loss"],
+                "entropy": train_metrics["entropy"],
+                "candidate_eval": evaluation["metrics"].get("candidate"),
+                "baseline_eval": evaluation["metrics"].get("baseline"),
+                "improved": improved,
+            }
+            if rich_logging:
+                dashboard.log_iteration_summary(stdout_payload)
+            else:
+                print(json.dumps(stdout_payload, ensure_ascii=True))
+
+        dashboard.finish()
 
 
 if __name__ == "__main__":

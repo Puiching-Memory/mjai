@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict
 from pathlib import Path
+from typing import Callable
 
 from train.self_play import PolicyMatchSpec, run_match_series, summarize_matches
 from train.training_config import RewardConfig
@@ -65,6 +66,7 @@ def evaluate_policy_paths(
     seed: int,
     deterministic: bool,
     reward_config: RewardConfig,
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> dict[str, object]:
     if baseline_checkpoint is None:
         match_specs = build_selfplay_match_specs(
@@ -85,6 +87,7 @@ def evaluate_policy_paths(
         reward_config=reward_config,
         workers=workers,
         seed=seed,
+        progress_callback=progress_callback,
     )
     metrics = summarize_matches(match_results)
     return {

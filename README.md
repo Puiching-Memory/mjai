@@ -3,9 +3,11 @@
 
 ## 环境
 
-本仓库使用 uv 管理 Python 环境，当前固定为 Python 3.12。
+本仓库使用 uv 管理本地实验环境，当前固定为 Python 3.14。
 
-> `mjai==0.2.1` 目前无法在 Python 3.14 下构建，因此不要用 3.14 创建虚拟环境。
+`mjai==0.2.1` 仍然依赖较老的 PyO3，默认并不声明支持 Python 3.14；仓库已经通过 `tool.uv.extra-build-variables` 为 `mjai` 注入 `PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1`，允许本地实验环境继续使用 3.14。
+
+原生推理运行时的本地开发工具链当前固定为 Rust 1.94，并使用 `edition = "2024"`。
 
 ## 比赛运行环境
 
@@ -50,6 +52,8 @@
 - 如果训练在 CUDA 上进行，部署产物仍应以 CPU 推理为主。
 - 如果提交固定模型的原生推理库，编译目标应对齐到 `linux/amd64`、Python 3.10、glibc 2.35、GCC 11、AVX2。
 - 需要以比赛镜像实测版本为准，不要假设本地 `uv` 环境中的 `mjai==0.2.1` 或更高版本在比赛环境中可用。
+
+换句话说：本地实验环境现在可以激进升级，但最终提交物仍然是预先构建好的原生二进制和模型产物，不依赖比赛镜像内重新编译这些本地依赖。
 
 安装依赖：
 
@@ -100,6 +104,8 @@ Python 侧安装训练与导出依赖：
 ```powershell
 uv sync --extra train
 ```
+
+当前实验环境的 train extra 会使用更激进的版本基线，并把 Torch 固定到官方 CUDA 12.8 索引；Windows 和 Linux 上执行 `uv sync --extra train` 时会从 `https://download.pytorch.org/whl/cu128` 解析 Torch。
 
 生成一个最小可验证 checkpoint：
 
@@ -217,6 +223,16 @@ uv run python tools/evaluate_checkpoint.py --checkpoint artifacts/policy.pt --ba
 
 ```powershell
 uv run python tools/train_reinforce.py --checkpoint artifacts/policy.pt --best-checkpoint artifacts/policy.best.pt --iterations 10 --matches-per-iteration 8 --evaluation-matches 8 --workers 4 --device auto
+```
+
+交互终端下默认会启用 Rich TUI，实时显示 self-play、优化、评测三个阶段的进度条，独立事件日志面板，以及 rank、score、loss、entropy 四块折线图。
+
+训练脚本默认会把逐手 bot 日志压到 `WARNING`，避免刷屏干扰 TUI；如果要恢复详细对局日志，可以先设置环境变量 `MJAI_LOG_LEVEL=INFO`。
+
+如果需要保留旧的机器可读 stdout JSON，可以显式使用：
+
+```powershell
+uv run python tools/train_reinforce.py --log-format json
 ```
 
 训练脚本每轮会执行：

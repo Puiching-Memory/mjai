@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import tempfile
 from collections import defaultdict
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from mjai.engine import DockerMjaiLogEngine
 from mjai.mlibriichi.arena import Match  # type: ignore
@@ -128,17 +128,39 @@ def run_match_series(
     reward_config: RewardConfig,
     workers: int,
     seed: int,
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> list[dict[str, Any]]:
     jobs = [
         (policy_specs, _seed_for_match(seed, match_index), reward_config)
         for match_index, policy_specs in enumerate(policy_specs_by_match)
     ]
 
+    total_jobs = len(jobs)
+    if total_jobs == 0:
+        return []
+
     if workers <= 1:
-        return [_run_single_match(*job) for job in jobs]
+        results = []
+        for completed, job in enumerate(jobs, start=1):
+            results.append(_run_single_match(*job))
+            if progress_callback is not None:
+                progress_callback(completed, total_jobs)
+        return results
 
     with ProcessPoolExecutor(max_workers=workers) as executor:
-        return list(executor.map(_run_single_match_job, jobs))
+        future_to_index = {
+            executor.submit(_run_single_match_job, job): index
+            for index, job in enumerate(jobs)
+        }
+        results: list[dict[str, Any] | None] = [None] * total_jobs
+        completed = 0
+        for future in as_completed(future_to_index):
+            index = future_to_index[future]
+            results[index] = future.result()
+            completed += 1
+            if progress_callback is not None:
+                progress_callback(completed, total_jobs)
+    return [result for result in results if result is not None]
 
 
 def summarize_matches(match_results: list[dict[str, Any]]) -> dict[str, PolicyMetrics]:
