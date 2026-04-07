@@ -56,22 +56,3 @@ def base_tile(tile: str) -> str:
 def tile_sort_key(tile: str) -> tuple[int, int]:
     normalized = base_tile(tile)
     return TILE_INDEX[normalized], 1 if tile.endswith("r") else 0
-
-
-def tile_one_hot(tile: str) -> list[float]:
-    vector = [0.0] * len(TILE_TYPES)
-    vector[TILE_INDEX[base_tile(tile)]] = 1.0
-    return vector
-
-
-def tile_histogram(tiles: list[str] | tuple[str, ...]) -> list[float]:
-    vector = [0.0] * len(TILE_TYPES)
-    for tile in tiles:
-        vector[TILE_INDEX[base_tile(tile)]] += 1.0
-    return vector
-
-
-def action_type_one_hot(action_type: str) -> list[float]:
-    vector = [0.0] * len(ACTION_TYPES)
-    vector[ACTION_TYPE_INDEX[action_type]] = 1.0
-    return vector

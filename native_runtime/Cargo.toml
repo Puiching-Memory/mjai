@@ -9,3 +9,4 @@ anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tract-onnx = "0.23.0-dev.3"
+mjai_core = { package = "mjai", path = "vendor/mjai.app", default-features = false }

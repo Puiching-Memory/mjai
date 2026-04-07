@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from rust_mjai_bot import resolve_bot_decision_path
 from train.inference_spec import ACTION_DIM, INPUT_DIM
 
 COMPETITION_IMAGE = "smly/mjai-client:v3"
@@ -183,8 +184,10 @@ def build_submission_zip(
 
     files_to_package = {
         ROOT / "bot.py": "bot.py",
+        ROOT / "rust_mjai_bot.py": "rust_mjai_bot.py",
         ROOT / "train" / "__init__.py": "train/__init__.py",
         ROOT / "train" / "inference_spec.py": "train/inference_spec.py",
+        resolve_bot_decision_path(): "artifacts/mjai-bot-decision",
         runtime_path: "artifacts/mjai-tract-runtime",
         onnx_path: "artifacts/policy.onnx",
         metadata_path: "artifacts/policy.json",

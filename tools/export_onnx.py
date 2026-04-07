@@ -70,17 +70,20 @@ def main() -> None:
         input_names=["features"],
         output_names=["logits"],
         opset_version=args.opset,
+        dynamo=False,
     )
 
     metadata = {
-        "model_type": "policy_mlp",
+        "model_type": "async_actor_critic_policy",
         "checkpoint": str(args.checkpoint.name),
         "input_dim": config.input_dim,
         "action_dim": config.action_dim,
         "hidden_dims": list(config.hidden_dims),
+        "value_hidden_dims": list(config.value_hidden_dims),
         "dropout": config.dropout,
         "onnx_opset": args.opset,
         "onnx_file": onnx_path.name,
+        "export_outputs": ["logits"],
     }
     metadata_path.write_text(json.dumps(metadata, ensure_ascii=True, indent=2), encoding="utf-8")
 

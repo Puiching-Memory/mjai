@@ -7,8 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from mjai.engine import DockerMjaiLogEngine
-from mjai.mlibriichi.arena import Match  # type: ignore
+from rust_mjai_arena import Match
+from rust_mjai_engine import InProcessMjaiBotEngine
 
 from train.checkpoints import build_model_from_checkpoint
 from train.training_bot import EpisodeResult, SelfPlayBot
@@ -33,13 +33,6 @@ class PolicyMetrics:
     last_rate: float
     average_reward: float
     average_decisions: float
-
-
-class InProcessMjaiBotEngine(DockerMjaiLogEngine):
-    def end_game(self, game_idx: int, scores: list[int]):
-        if hasattr(self.player, "on_game_end"):
-            self.player.on_game_end(scores)
-        super().end_game(game_idx, scores)
 
 
 def _run_single_match(

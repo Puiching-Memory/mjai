@@ -13,12 +13,14 @@ from train.policy_net import PolicyNet, PolicyNetConfig
 def default_policy_config(
     hidden_dims: tuple[int, ...] = (256, 256),
     dropout: float = 0.0,
+    value_hidden_dims: tuple[int, ...] = (),
 ) -> PolicyNetConfig:
     return PolicyNetConfig(
         input_dim=INPUT_DIM,
         action_dim=ACTION_DIM,
         hidden_dims=hidden_dims,
         dropout=dropout,
+        value_hidden_dims=value_hidden_dims,
     )
 
 
@@ -27,16 +29,24 @@ def initialize_checkpoint(
     *,
     hidden_dims: tuple[int, ...] = (256, 256),
     dropout: float = 0.0,
+    value_hidden_dims: tuple[int, ...] = (),
     seed: int = 0,
 ) -> dict[str, Any]:
     torch.manual_seed(seed)
-    config = default_policy_config(hidden_dims=hidden_dims, dropout=dropout)
+    config = default_policy_config(
+        hidden_dims=hidden_dims,
+        dropout=dropout,
+        value_hidden_dims=value_hidden_dims,
+    )
     model = PolicyNet(config)
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
+        "format_version": 2,
+        "model_type": "async_actor_critic_policy",
         "config": config.to_dict(),
         "model_state_dict": model.state_dict(),
         "step": 0,
+        "policy_version": 0,
         "metrics": {},
     }
     torch.save(payload, checkpoint_path)
@@ -81,14 +91,18 @@ def save_checkpoint(
     model: PolicyNet,
     config: PolicyNetConfig,
     step: int,
+    policy_version: int | None = None,
     optimizer_state_dict: dict[str, Any] | None = None,
     metrics: dict[str, Any] | None = None,
 ) -> None:
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     payload: dict[str, Any] = {
+        "format_version": 2,
+        "model_type": "async_actor_critic_policy",
         "config": config.to_dict(),
         "model_state_dict": model.state_dict(),
         "step": step,
+        "policy_version": step if policy_version is None else policy_version,
         "metrics": metrics or {},
     }
     if optimizer_state_dict is not None:

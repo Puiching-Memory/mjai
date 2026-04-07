@@ -59,8 +59,13 @@ def main() -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
+            "format_version": 2,
+            "model_type": "async_actor_critic_policy",
             "config": config.to_dict(),
             "model_state_dict": model.state_dict(),
+            "step": 0,
+            "policy_version": 0,
+            "metrics": {},
         },
         output_path,
     )

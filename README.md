@@ -1,302 +1,224 @@
 # mjai
-一项针对mjai.app麻将AI竞赛的强化学习研究
 
-## 环境
+针对 [mjai.app](https://mjai.app) 麻将 AI 竞赛的强化学习研究仓库。
 
-本仓库使用 uv 管理本地实验环境，当前固定为 Python 3.14。
+训练用 PyTorch，部署用 ONNX + Rust/tract，提交物是预构建的原生二进制 + 模型产物。
 
-`mjai==0.2.1` 仍然依赖较老的 PyO3，默认并不声明支持 Python 3.14；仓库已经通过 `tool.uv.extra-build-variables` 为 `mjai` 注入 `PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1`，允许本地实验环境继续使用 3.14。
+## 快速开始
 
-原生推理运行时的本地开发工具链当前固定为 Rust 1.94，并使用 `edition = "2024"`。
-
-## 比赛运行环境
-
-比赛提交实际运行在 `docker.io/smly/mjai-client:v3` 中。该镜像已经实测，不应仅依赖上游仓库当前 `docker/` 目录里的版本声明来推断环境。
-
-实测关键结论：
-
-- 平台为 `linux/amd64`，系统为 Ubuntu 22.04 系列，glibc 为 2.35。
-- Python 版本为 `3.10.12`。
-- PyTorch 实际版本为 `2.0.1+cu117`，不是上游仓库当前 Dockerfile 中声明的 2.2.x。
-- `torch.cuda.is_available()` 为 `False`，因此比赛执行应按 CPU 推理设计。
-- Torch CPU 后端可用 MKL、MKLDNN、OpenMP，构建目标明确启用了 AVX2。
-- `mjai` 在镜像中的实际版本为 `0.1.9`，不是本地开发环境中的 `0.2.1`。
-
-镜像内实测 Python 包：
-
-- `torch==2.0.1+cu117`
-- `triton==2.0.0`
-- `numpy==1.25.2`
-- `mjai==0.1.9`
-- `mahjong==1.2.1`
-- `loguru==0.7.0`
-- `requests==2.31.0`
-
-镜像内实测工具链：
-
-- `gcc==11.4.0`
-- `g++==11.4.0`
-- `cmake==3.22.1`
-- `rustc==1.73.0-nightly`
-- `cargo==1.73.0-nightly`
-- `protoc==3.17.3`
-
-镜像中可见的原生库特征：
-
-- `mjai` 带有本地扩展 `mlibriichi.cpython-310-x86_64-linux-gnu.so`
-- Torch 自带 `libtorch_cpu.so`、`libtorch.so`、`libc10.so`、`libtorch_cuda.so` 等动态库
-- `libtorch_cpu.so` 依赖 `libgomp`、`libstdc++`、`libc10` 和 `libcudart`
-
-对部署的直接约束：
-
-- 如果训练在 CUDA 上进行，部署产物仍应以 CPU 推理为主。
-- 如果提交固定模型的原生推理库，编译目标应对齐到 `linux/amd64`、Python 3.10、glibc 2.35、GCC 11、AVX2。
-- 需要以比赛镜像实测版本为准，不要假设本地 `uv` 环境中的 `mjai==0.2.1` 或更高版本在比赛环境中可用。
-
-换句话说：本地实验环境现在可以激进升级，但最终提交物仍然是预先构建好的原生二进制和模型产物，不依赖比赛镜像内重新编译这些本地依赖。
-
-安装依赖：
-
-```powershell
-uv sync
+```bash
+# 环境要求：Python 3.14、Rust 1.94、uv
+uv sync                  # 基础依赖（部署）
+uv sync --extra train    # 训练依赖（torch, mjai, onnx, rich）
 ```
 
-## 运行
+两条核心命令：
 
-启动机器人：
-
-```powershell
-uv run python bot.py 0
+```bash
+uv run python tools/cli.py train --preset single   # 训练
+uv run python tools/cli.py infer --seat 0           # 推理
 ```
 
-## 当前策略
+不带子命令直接运行 `uv run python tools/cli.py` 会打开 Rich 命令总览页。
 
-bot.py 当前实现的是一个混合控制流机器人，主要行为如下：
+## 项目结构
 
-- 能和牌时立即和牌。
-- 能立直时立即立直。
-- 满足九种九牌时直接选择流局。
-- Pon 候选只在役牌或已经副露推进手牌时送入原生动作头。
-- Chi 候选只在已经副露或能明显推进向听时送入原生动作头。
-- 常规弃牌、立直声明后的弃牌、以及 pass/pon/chi 选择都由原生 tract 运行时负责，不再回退到规则动作。
-- 如果原生运行时、模型文件或元数据缺失，bot 会直接报错而不是降级运行。
+```
+bot.py                  部署 bot 入口（BasicMahjongBot + ONNX 推理）
+rust_mjai_bot.py        Rust 子进程通信层（SubprocessJsonClient、RustMjaiBot、game utils）
+rust_mjai_engine.py     mjai-log 引擎适配器（DockerMjaiLogEngine、InProcessMjaiBotEngine）
+rust_mjai_arena.py      mjai Rust arena 的 Python 封装
 
-最小可运行示例（PowerShell）：
+train/
+  inference_spec.py     特征规格常量（INPUT_DIM=1281、ACTION_DIM=14）
+  policy_net.py         策略网络定义
+  async_self_play.py    异步 actor-learner 自对弈（共享内存 + batched inference）
+  self_play.py          同步 ProcessPoolExecutor 自对弈（用于评测）
+  async_training_bot.py 异步自对弈 bot
+  training_bot.py       同步自对弈 bot
+  training_config.py    训练配置与奖励函数
+  checkpoints.py        checkpoint 加载与保存
+  evaluation.py         评测逻辑
+  profiling.py          NVTX profiling 标注
+  training_ui.py        Rich UI 组件
 
-```powershell
-@'
-[{"type":"start_game","names":["0","1","2","3"],"id":0}]
-[{"type":"start_kyoku","bakaze":"E","dora_marker":"2s","kyoku":1,"honba":0,"kyotaku":0,"oya":0,"scores":[25000,25000,25000,25000],"tehais":[["E","6p","9m","8m","C","2s","7m","S","6m","1m","S","3s","8m"],["?","?","?","?","?","?","?","?","?","?","?","?","?"],["?","?","?","?","?","?","?","?","?","?","?","?","?"],["?","?","?","?","?","?","?","?","?","?","?","?","?"]]},{"type":"tsumo","actor":0,"pai":"1m"}]
-'@ | uv run python bot.py 0
+tools/
+  cli.py                统一 CLI 入口
+  train_reinforce.py    底层 async trainer
+  export_onnx.py        导出 ONNX + 元数据
+  init_policy_checkpoint.py  生成初始 checkpoint
+  evaluate_checkpoint.py     独立评测脚本
+  profile_async_training.py  Nsight Systems profiling 封装
+  validate_competition_image.py  比赛镜像闭环验证
+  mjai_oracle.py        Python mjai 包的 oracle 探针（测试用）
+
+native_runtime/         Rust crate
+  src/bin/
+    mjai-bot-decision   状态机 + 候选编译 + 特征编码（单进程）
+    mjai-tract-runtime  ONNX 推理（tract 后端）
+    mjai-rust-oracle    Rust 侧 oracle（合约测试用）
 ```
 
-## 第一档原生部署骨架
+## 架构
 
-当前仓库已经补上了一套第一档方案的最小骨架：
+```
+┌──────────────────────────── 部署 ────────────────────────────┐
+│                                                               │
+│  mjai 事件流 → mjai-bot-decision → candidates + features      │
+│                (Rust 子进程)         ↓                         │
+│                                mjai-tract-runtime → action    │
+│                                (Rust 子进程, ONNX)            │
+│                                                               │
+│  bot.py: 规则动作（和牌/立直/九种九牌）                        │
+│        + 原生动作头（弃牌/副露选择）                           │
+└───────────────────────────────────────────────────────────────┘
 
-- Python 侧继续用 Torch 训练和导出。
-- 导出产物为 `model.onnx` 和 `model.json`。
-- 部署侧使用 `native_runtime/` 下的 Rust + tract 二进制执行推理。
-- 推理二进制通过标准输入读取 JSON，请求里只包含特征向量和合法动作掩码。
-
-Python 侧安装训练与导出依赖：
-
-```powershell
-uv sync --extra train
+┌──────────────────────────── 训练 ────────────────────────────┐
+│                                                               │
+│  CPU actor 进程 → 共享内存 → batched inference server (GPU)   │
+│  (mjai arena self-play)         ↓                             │
+│                            权重同步                           │
+│  replay buffer ←── episode tensors                            │
+│       ↓                                                       │
+│  learner (PPO-style actor-critic)                             │
+│       ↓                                                       │
+│  周期性后台评测 → best checkpoint 更新                        │
+└───────────────────────────────────────────────────────────────┘
 ```
 
-当前实验环境的 train extra 会使用更激进的版本基线，并把 Torch 固定到官方 CUDA 12.8 索引；Windows 和 Linux 上执行 `uv sync --extra train` 时会从 `https://download.pytorch.org/whl/cu128` 解析 Torch。
+## 构建原生二进制
 
-生成一个最小可验证 checkpoint：
-
-```powershell
-uv run python tools/init_policy_checkpoint.py --output artifacts/policy.pt --hidden-dims 32 32
-```
-
-导出 ONNX 与元数据：
-
-```powershell
-uv run python tools/export_onnx.py --checkpoint artifacts/policy.pt --onnx artifacts/policy.onnx
-```
-
-本机构建 tract 推理器：
-
-```powershell
+```bash
 cargo build --release --manifest-path native_runtime/Cargo.toml
 ```
 
-如果要拿到更适合比赛镜像直接运行的静态 Linux 二进制，可以用 Docker 产出 `musl` 版本：
+同一次构建产出 `mjai-bot-decision` 和 `mjai-tract-runtime`。
 
-```powershell
+静态 musl 版本（用于比赛提交）：
+
+```bash
 docker build -f native_runtime/Dockerfile.musl -t mjai-tract-runtime-build native_runtime
-docker create --name mjai-tract-runtime-out mjai-tract-runtime-build
-docker cp mjai-tract-runtime-out:/mjai-tract-runtime artifacts/mjai-tract-runtime
-docker rm mjai-tract-runtime-out
+docker create --name tmp mjai-tract-runtime-build
+docker cp tmp:/mjai-tract-runtime artifacts/mjai-tract-runtime
+docker rm tmp
 ```
 
-推理请求结构说明：
+## 训练
 
-- `features` 是长度为 [train/inference_spec.py](train/inference_spec.py) 中 `INPUT_DIM` 的 `float[]`。
-- `legal_actions` 是长度为 [train/inference_spec.py](train/inference_spec.py) 中 `ACTION_DIM` 的 `bool[]`。
-
-本地 smoke test：
-
-```powershell
-uv run python -c "import json; from train.inference_spec import ACTION_DIM, INPUT_DIM; print(json.dumps({'features': [0.0] * INPUT_DIM, 'legal_actions': [index == 0 for index in range(ACTION_DIM)]}))" | .\native_runtime\target\release\mjai-tract-runtime.exe artifacts/policy.onnx artifacts/policy.json
+```bash
+uv run python tools/cli.py train --preset single
 ```
 
-当前这套骨架已经和 [bot.py](bot.py) 做了联动：
+未识别参数透传给底层 trainer：
 
-- 原生运行时接管常规弃牌、立直声明后的弃牌、以及 pass/pon/chi 的选择。
-- 和牌、荣和、立直声明本身、九种九牌流局仍由规则逻辑处理。
-- 可选鸣牌会先经过基础规则过滤，再进入统一动作头参与选择。
-- 固定输入维度和动作槽位定义在 [train/inference_spec.py](train/inference_spec.py)。
-- 原生运行时缺失、启动失败、通信失败或返回非法动作时会直接失败，不会回退到规则动作。
-
-现阶段解决的是三件事：
-
-- 训练侧与部署侧彻底解耦。
-- 部署侧不需要 Torch 和 onnxruntime。
-- 可以直接产出一个可执行文件随提交一起带入比赛环境。
-
-bot 会自动查找这些默认路径：
-
-- `artifacts/policy.onnx`
-- `artifacts/policy.json`
-- `artifacts/mjai-tract-runtime(.exe)`
-- `native_runtime/target/release/mjai-tract-runtime(.exe)`
-
-这些文件至少要满足一组可用，否则 [bot.py](bot.py) 会在启动时直接失败。
-
-也可以显式指定环境变量：
-
-```powershell
-$env:MJAI_NATIVE_RUNTIME_BIN = (Resolve-Path .\native_runtime\target\release\mjai-tract-runtime.exe)
-$env:MJAI_NATIVE_RUNTIME_ONNX = (Resolve-Path .\artifacts\policy.onnx)
-$env:MJAI_NATIVE_RUNTIME_META = (Resolve-Path .\artifacts\policy.json)
+```bash
+uv run python tools/cli.py train --preset single --total-learner-steps 200 --actor-processes 12
 ```
 
-桥接层端到端验证：
+底层 trainer 直接调用：
 
-```powershell
-@'
-[{"type":"start_game","names":["0","1","2","3"],"id":0}]
-[{"type":"start_kyoku","bakaze":"E","dora_marker":"2s","kyoku":1,"honba":0,"kyotaku":0,"oya":0,"scores":[25000,25000,25000,25000],"tehais":[["E","6p","9m","8m","C","2s","7m","S","6m","1m","S","3s","8m"],["?","?","?","?","?","?","?","?","?","?","?","?","?"],["?","?","?","?","?","?","?","?","?","?","?","?","?"],["?","?","?","?","?","?","?","?","?","?","?","?","?"]]},{"type":"tsumo","actor":0,"pai":"1m"}]
-'@ | uv run python bot.py 0
+```bash
+uv run python tools/train_reinforce.py \
+  --checkpoint artifacts/policy.pt \
+  --best-checkpoint artifacts/policy.best.pt \
+  --learner-device cuda:0 \
+  --inference-device cuda:0 \
+  --actor-processes 8 \
+  --total-learner-steps 1000 \
+  --warmup-steps 4096 \
+  --minibatch-size 2048 \
+  --evaluation-matches 8
 ```
 
-## 训练与评测
+### 关键参数
 
-当前仓库已经具备一条最小可运行的强化学习闭环：
+| 参数                     | 说明                                                |
+| ------------------------ | --------------------------------------------------- |
+| `--actor-processes`      | 常驻 self-play actor 数量                           |
+| `--learner-device`       | 优化器所在设备                                      |
+| `--inference-device`     | batched policy inference 所在设备                   |
+| `--warmup-steps`         | learner 启动前 replay 需积累的最少决策步数          |
+| `--policy-sync-interval` | 权重发布到 inference server 的频率                  |
+| `--max-policy-lag`       | 防止 learner 消费过旧样本                           |
+| `--inference-timeout-ms` | inference 聚合窗口（actor 多时放宽提高 batch size） |
+| `--evaluation-matches`   | >0 时周期性后台评测并更新 best checkpoint           |
 
-- 本地用 `mjai==0.2.1` 的进程内对局做 self-play 与评测。
-- 学习器使用 Torch 做 REINFORCE 更新。
-- 训练后继续导出为 ONNX，再交给 Rust + tract 原生运行时部署。
+### 产物
 
-当前保留了监督预训练接口，但默认明确禁用：
+- `artifacts/policy.pt` — 最新 checkpoint
+- `artifacts/policy.best.pt` — 评测最优 checkpoint
+- `artifacts/training_metrics.jsonl` — 训练指标日志
 
-- 没有整理好的对局数据前，不应启用 `--enable-supervised-pretrain`。
-- 这个开关目前会直接抛出 `NotImplementedError`，目的是保留命令行接口而不是偷偷走空实现。
+## 评测
 
-单 checkpoint 自对战评测：
+```bash
+# 单 checkpoint 自对战
+uv run python tools/evaluate_checkpoint.py \
+  --checkpoint artifacts/policy.pt --matches 8 --workers 4
 
-```powershell
-uv run python tools/evaluate_checkpoint.py --checkpoint artifacts/policy.pt --matches 8 --workers 4
+# candidate vs best
+uv run python tools/evaluate_checkpoint.py \
+  --checkpoint artifacts/policy.pt \
+  --baseline-checkpoint artifacts/policy.best.pt \
+  --matches 16 --workers 4
 ```
 
-candidate 对 best checkpoint 评测：
+## 导出部署产物
 
-```powershell
-uv run python tools/evaluate_checkpoint.py --checkpoint artifacts/policy.pt --baseline-checkpoint artifacts/policy.best.pt --matches 16 --workers 4
-```
+```bash
+# 生成初始 checkpoint（调试用）
+uv run python tools/init_policy_checkpoint.py --output artifacts/policy.pt --hidden-dims 32 32
 
-评测输出当前包含这些指标：
-
-- `average_rank`
-- `average_score`
-- `top1_rate`
-- `last_rate`
-- `average_reward`
-- `average_decisions`
-
-最小 REINFORCE 训练命令：
-
-```powershell
-uv run python tools/train_reinforce.py --checkpoint artifacts/policy.pt --best-checkpoint artifacts/policy.best.pt --iterations 10 --matches-per-iteration 8 --evaluation-matches 8 --workers 4 --device auto
-```
-
-交互终端下默认会启用 Rich TUI，实时显示 self-play、优化、评测三个阶段的进度条，独立事件日志面板，以及 rank、score、loss、entropy 四块折线图。
-
-训练脚本默认会把逐手 bot 日志压到 `WARNING`，避免刷屏干扰 TUI；如果要恢复详细对局日志，可以先设置环境变量 `MJAI_LOG_LEVEL=INFO`。
-
-如果需要保留旧的机器可读 stdout JSON，可以显式使用：
-
-```powershell
-uv run python tools/train_reinforce.py --log-format json
-```
-
-训练脚本每轮会执行：
-
-- 先做 self-play 采样。
-- 再按回合奖励做一轮 REINFORCE 更新。
-- 然后拿当前 checkpoint 对 `best_checkpoint` 做对局评测。
-- 如果平均名次更优，或平均名次相同但平均分更高，就覆盖 `best_checkpoint`。
-
-训练产物默认包括：
-
-- `artifacts/policy.pt`
-- `artifacts/policy.best.pt`
-- `artifacts/training_metrics.jsonl`
-
-设备建议：
-
-- self-play worker 始终是 CPU 进程。
-- 学习器可以用 `--device cpu` 或 `--device cuda`，默认 `auto` 会在有 GPU 时自动切到 `cuda`。
-- 如果只有 CPU，先把 `workers` 开起来通常比盲目增大模型更划算。
-- 如果有单卡 GPU，推荐继续用 CPU 跑 self-play，把 GPU 留给 learner 做梯度更新。
-
-训练完成后，记得重新导出部署产物：
-
-```powershell
+# 导出 ONNX + 元数据
 uv run python tools/export_onnx.py --checkpoint artifacts/policy.pt --onnx artifacts/policy.onnx
 ```
 
-## 比赛镜像内闭环验证
+## 二进制查找规则
 
-如果本机已经安装 Docker，并且你已经在开发环境中产出了 Linux `amd64` 可执行二进制，可以直接用下面这条命令按“比赛提交 ZIP”的方式做闭环验证：
+| 组件               | 查找路径                                           | 环境变量覆盖               |
+| ------------------ | -------------------------------------------------- | -------------------------- |
+| mjai-tract-runtime | `artifacts/` → `native_runtime/target/release/`    | `MJAI_NATIVE_RUNTIME_BIN`  |
+| policy.onnx        | `artifacts/policy.onnx`                            | `MJAI_NATIVE_RUNTIME_ONNX` |
+| policy.json        | `artifacts/policy.json`                            | `MJAI_NATIVE_RUNTIME_META` |
+| mjai-bot-decision  | `artifacts/` → `target/release/` → `target/debug/` | `MJAI_BOT_DECISION_BIN`    |
 
-```powershell
+## Profiling
+
+仓库在训练主循环、actor 请求、batched inference、learner update 上已有 NVTX 标注：
+
+```bash
+uv run python tools/profile_async_training.py \
+  --output artifacts/nsys_profile \
+  --cuda-visible-devices 0 \
+  --cuda-memory-usage \
+  -- \
+  --checkpoint artifacts/policy.pt \
+  --best-checkpoint artifacts/policy.best.pt \
+  --learner-device cpu \
+  --inference-device cuda:0 \
+  --actor-processes 4 \
+  --total-learner-steps 20 \
+  --warmup-steps 512 \
+  --minibatch-size 256 \
+  --evaluation-matches 0
+```
+
+产出 `*.nsys-rep`（GUI 时间线）、`*.sqlite`（中间库）、`*.summary.txt`（摘要）。关闭 NVTX 标注：`MJAI_ENABLE_NVTX=0`。
+
+## 比赛镜像验证
+
+```bash
 uv run python tools/validate_competition_image.py
 ```
 
-运行前需要确保 Docker daemon 已经启动，并且当前处于 Linux containers 模式。
+在 `docker.io/smly/mjai-client:v3` 中执行：生成提交 ZIP → 解压检查 runtime → 回放固定事件流。
 
-这个脚本会按顺序执行三件事：
+比赛镜像约束：Ubuntu 22.04 / glibc 2.35 / Python 3.10 / Torch 2.0.1 / 无 CUDA / mjai 0.1.9 / AVX2。
 
-- 从当前工作区生成一个与比赛提交格式一致的单一 ZIP，默认输出到 `artifacts/submission.zip`。
-- 创建一个临时比赛容器，把这个 ZIP 复制进去，并在容器里用 `python3 -m zipfile -e` 解压。
-- 在解压后的提交目录里直接运行原生 runtime，验证 `policy.onnx` 和 `policy.json` 与当前协议维度一致。
-- 在解压后的提交目录里用 `python3 bot.py <seat>` 回放固定 mjai 事件流，覆盖一个 `call-choice` 分支和一个 `riichi-discard` 分支。
-
-默认回放的样例文件在：
-
-- [tools/fixtures/competition_call_choice.jsonl](tools/fixtures/competition_call_choice.jsonl)
-- [tools/fixtures/competition_riichi_discard.jsonl](tools/fixtures/competition_riichi_discard.jsonl)
-
-如果你的预构建 Linux 二进制不在默认路径，也可以显式指定：
-
-```powershell
+```bash
+# 指定 runtime 路径
 uv run python tools/validate_competition_image.py --runtime-path path/to/mjai-tract-runtime
-```
 
-如果你想把生成的提交 ZIP 放到其他位置，也可以指定：
-
-```powershell
+# 使用已有 ZIP
 uv run python tools/validate_competition_image.py --submission-zip path/to/submission.zip
-```
-
-如果你只想跳过直接 runtime smoke test、保留 bot 事件流回放，可以这样跑：
-
-```powershell
-uv run python tools/validate_competition_image.py --skip-runtime-smoke
 ```

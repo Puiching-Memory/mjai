@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 import sys
+
+os.environ.setdefault("MJAI_LOG_LEVEL", "WARNING")
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:

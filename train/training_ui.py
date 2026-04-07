@@ -4,28 +4,28 @@ from collections import deque
 from datetime import datetime
 import sys
 from pathlib import Path
+from time import perf_counter
 from typing import Any, Sequence
 
-from rich import box
 from rich.align import Align
 from rich.console import Console, Group
 from rich.layout import Layout
 from rich.live import Live
 from rich.panel import Panel
-from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn, TimeElapsedColumn
 from rich.table import Table
 from rich.text import Text
 
 _HISTORY_LIMIT = 64
-_LOG_LIMIT = 10
+_LOG_HISTORY_LIMIT = 512
+_VISIBLE_LOG_LINES = 10
 _CHART_HEIGHT = 8
-_CHART_WIDTH = 34
+_CHART_WIDTH = 36
 
 
 def resolve_rich_logging(log_format: str) -> bool:
     if log_format == "rich":
         return True
-    if log_format == "json":
+    if log_format in {"json", "text"}:
         return False
     return sys.stdout.isatty()
 
@@ -34,12 +34,6 @@ def _format_float(value: Any, digits: int = 4) -> str:
     if value is None:
         return "-"
     return f"{float(value):.{digits}f}"
-
-
-def _format_pct(value: Any) -> str:
-    if value is None:
-        return "-"
-    return f"{float(value) * 100.0:.1f}%"
 
 
 def _trim(values: Sequence[float], limit: int = _HISTORY_LIMIT) -> list[float]:
@@ -88,64 +82,132 @@ def _format_axis_label(value: float, digits: int) -> str:
     return f"{value:.{digits}f}" if digits > 0 else f"{value:.0f}"
 
 
+def _format_elapsed(seconds: float | None) -> str:
+    if seconds is None:
+        return "-"
+    total_seconds = int(seconds)
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours > 0:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def _segment_char(x0: int, y0: int, x1: int, y1: int) -> str:
+    if y0 == y1:
+        return "-"
+    if x0 == x1:
+        return "|"
+    return "\\" if (x1 - x0) * (y1 - y0) > 0 else "/"
+
+
+def create_rich_console(*, stderr: bool = False) -> Console:
+    return Console(stderr=stderr)
+
+
+def render_info_panel(
+    *,
+    title: str,
+    rows: Sequence[tuple[str, str]],
+    border_style: str = "cyan",
+) -> Panel:
+    table = Table.grid(expand=True, padding=(0, 1))
+    table.add_column(style="bold cyan", width=14)
+    table.add_column()
+    for label, value in rows:
+        table.add_row(str(label), str(value))
+    return Panel(table, title=title, border_style=border_style)
+
+
+def render_example_panel(
+    *,
+    title: str,
+    rows: Sequence[tuple[str, str]],
+    border_style: str = "magenta",
+) -> Panel:
+    if not rows:
+        return Panel(Align.left(Text("no examples", style="dim")), title=title, border_style=border_style)
+
+    table = Table.grid(expand=True, padding=(0, 1))
+    table.add_column(style="bold magenta", width=14)
+    table.add_column()
+    for label, value in rows:
+        table.add_row(str(label), str(value))
+    return Panel(table, title=title, border_style=border_style)
+
+
+def render_note_panel(
+    *,
+    title: str,
+    lines: Sequence[str],
+    border_style: str = "yellow",
+) -> Panel:
+    if not lines:
+        return Panel(Align.left(Text("-", style="dim")), title=title, border_style=border_style)
+
+    content = Group(*(Text(f"- {line}") for line in lines))
+    return Panel(content, title=title, border_style=border_style)
+
+
 class TrainingDashboard:
     def __init__(
         self,
         *,
         enabled: bool,
-        total_iterations: int,
-        device: str,
+        total_steps: int,
+        warmup_steps: int,
+        learner_device: str,
+        inference_device: str,
+        actor_processes: int,
         checkpoint_path: Path,
         best_checkpoint_path: Path,
         metrics_path: Path,
+        run_label: str | None = None,
     ) -> None:
         self.enabled = enabled
-        self.total_iterations = total_iterations
-        self.device = device
+        self.total_steps = max(int(total_steps), 1)
+        self.warmup_steps = max(int(warmup_steps), 1)
+        self.learner_device = learner_device
+        self.inference_device = inference_device
+        self.actor_processes = actor_processes
         self.checkpoint_path = checkpoint_path
         self.best_checkpoint_path = best_checkpoint_path
         self.metrics_path = metrics_path
+        self.run_label = run_label or "custom"
+        self.event_log_path = metrics_path.with_suffix(".events.log")
 
         self.console = Console(force_terminal=enabled)
         self.live: Live | None = None
-        self.progress = Progress(
-            SpinnerColumn(style="cyan"),
-            TextColumn("[progress.description]{task.description}"),
-            TextColumn("[bright_black]{task.fields[detail]}", justify="right"),
-            BarColumn(bar_width=None),
-            TaskProgressColumn(),
-            TimeElapsedColumn(),
-            console=self.console,
-            expand=True,
-        )
-        self.phase_task = self.progress.add_task("waiting", total=1, completed=0, detail="-")
-
-        self.run_iteration = 0
-        self.checkpoint_step = 0
-        self.phase = "waiting"
-        self.detail = "-"
-        self.examples = 0
-        self.improved: bool | None = None
-        self.self_play_summary: dict[str, dict[str, Any]] = {}
-        self.train_metrics: dict[str, float] = {}
-        self.evaluation_metrics: dict[str, dict[str, Any]] = {}
+        self.started_at = perf_counter()
+        self.phase = "starting"
+        self.detail = "bootstrapping runtime"
+        self.current_step = 0
+        self.progress_completed = 0.0
+        self.progress_total = float(self.total_steps)
+        self.latest_payload: dict[str, Any] | None = None
+        self.latest_evaluation: dict[str, Any] | None = None
+        self.events: deque[tuple[str, str, str]] = deque(maxlen=_LOG_HISTORY_LIMIT)
+        self.event_count = 0
         self.history: dict[str, list[float]] = {
             "step": [],
             "loss": [],
-            "entropy": [],
-            "candidate_rank": [],
-            "baseline_rank": [],
-            "candidate_score": [],
-            "baseline_score": [],
+            "decisions_per_sec": [],
+            "matches_per_sec": [],
+            "avg_batch_size": [],
+            "avg_inference_ms": [],
         }
-        self.events: deque[tuple[str, str, str]] = deque(maxlen=_LOG_LIMIT)
         self.layout = self._build_layout()
 
     def __enter__(self) -> TrainingDashboard:
+        if not self.enabled:
+            return self
+
+        self.event_log_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.event_log_path.open("a", encoding="utf-8") as handle:
+            handle.write(f"\n== training session {datetime.now().isoformat(timespec='seconds')} ==\n")
         self._update_all_panels()
-        if self.enabled:
-            self.live = Live(self.layout, console=self.console, transient=False, auto_refresh=False)
-            self.live.start()
+        self.live = Live(self.layout, console=self.console, transient=False, auto_refresh=False)
+        self.live.start()
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
@@ -157,177 +219,121 @@ class TrainingDashboard:
         if self.live is not None:
             self.live.refresh()
 
-    def start_iteration(self, *, run_iteration: int, checkpoint_step: int) -> None:
-        self.run_iteration = run_iteration
-        self.checkpoint_step = checkpoint_step
-        self.add_event(
-            f"iteration {run_iteration}/{self.total_iterations} started | checkpoint step {checkpoint_step}",
-            style="bold cyan",
-            refresh=False,
-        )
-        self._update_overview_panel()
-        self.refresh()
-
-    def set_phase(self, phase: str, *, total: int, completed: int = 0, detail: str = "-", announce: bool = True) -> None:
-        self.phase = phase
-        self.detail = detail
-        self.progress.update(
-            self.phase_task,
-            description=phase,
-            total=max(total, 1),
-            completed=min(completed, max(total, 1)),
-            detail=detail,
-        )
-        if announce:
-            self.add_event(f"phase {phase} | {detail}", style="yellow", refresh=False)
-        self._update_overview_panel()
-        self._update_progress_panel()
-        self.refresh()
-
-    def update_phase_progress(self, completed: int, total: int, *, detail: str | None = None) -> None:
-        if detail is not None:
-            self.detail = detail
-        self.progress.update(
-            self.phase_task,
-            total=max(total, 1),
-            completed=min(completed, max(total, 1)),
-            detail=self.detail,
-        )
-        self._update_overview_panel()
-        self._update_progress_panel()
-        self.refresh()
-
-    def record_self_play(self, summary: dict[str, Any], examples: int) -> None:
-        self.self_play_summary = {
-            key: dict(value)
-            for key, value in summary.items()
-        }
-        self.examples = examples
-        candidate = self.self_play_summary.get("candidate", {})
-        self.add_event(
-            "self-play done"
-            f" | examples {examples}"
-            f" | avg rank {_format_float(candidate.get('average_rank'), digits=3)}"
-            f" | avg score {_format_float(candidate.get('average_score'), digits=0)}",
-            style="green",
-            refresh=False,
-        )
-        self._update_overview_panel()
-        self._update_metrics_panel()
-        self.refresh()
-
-    def record_train(self, metrics: dict[str, float]) -> None:
-        self.train_metrics = dict(metrics)
-        self.add_event(
-            f"optimize done | loss {_format_float(metrics.get('loss'))} | entropy {_format_float(metrics.get('entropy'))}",
-            style="magenta",
-            refresh=False,
-        )
-        self._update_metrics_panel()
-        self.refresh()
-
-    def record_evaluation(self, metrics: dict[str, Any], improved: bool) -> None:
-        self.evaluation_metrics = {
-            key: dict(value)
-            for key, value in metrics.items()
-        }
-        self.improved = improved
-        candidate = self.evaluation_metrics.get("candidate", {})
-        baseline = self.evaluation_metrics.get("baseline", {})
-        self.add_event(
-            "evaluation done"
-            f" | cand {_format_float(candidate.get('average_rank'), digits=3)}"
-            f" vs base {_format_float(baseline.get('average_rank'), digits=3)}"
-            f" | {'best updated' if improved else 'kept current best'}",
-            style="cyan" if improved else "red",
-            refresh=False,
-        )
-        self._update_overview_panel()
-        self._update_metrics_panel()
-        self.refresh()
-
-    def record_iteration_history(self, metrics_row: dict[str, Any]) -> None:
-        candidate_eval = metrics_row["evaluation"].get("candidate") or {}
-        baseline_eval = metrics_row["evaluation"].get("baseline") or {}
-        self.history["step"].append(float(metrics_row["iteration"]))
-        self.history["loss"].append(float(metrics_row["train"]["loss"]))
-        self.history["entropy"].append(float(metrics_row["train"]["entropy"]))
-        self.history["candidate_rank"].append(float(candidate_eval.get("average_rank", 0.0)))
-        self.history["baseline_rank"].append(float(baseline_eval.get("average_rank", 0.0)))
-        self.history["candidate_score"].append(float(candidate_eval.get("average_score", 0.0)))
-        self.history["baseline_score"].append(float(baseline_eval.get("average_score", 0.0)))
-        self._update_chart_panels()
-        self.refresh()
-
-    def finish(self) -> None:
-        self.phase = "done"
-        self.detail = "training complete"
-        self.progress.update(
-            self.phase_task,
-            description="done",
-            total=1,
-            completed=1,
-            detail="training complete",
-        )
-        self.add_event("training complete", style="bold green", refresh=False)
-        self._update_overview_panel()
-        self._update_progress_panel()
-        self.refresh()
-
-    def log_iteration_summary(self, payload: dict[str, Any]) -> None:
-        candidate = payload.get("candidate_eval") or {}
-        baseline = payload.get("baseline_eval") or {}
-        parts = [
-            f"step {payload['iteration']}",
-            f"loss {_format_float(payload.get('loss'))}",
-            f"entropy {_format_float(payload.get('entropy'))}",
-            f"cand.rank {_format_float(candidate.get('average_rank'), digits=3)}",
-        ]
-        if baseline:
-            parts.append(f"base.rank {_format_float(baseline.get('average_rank'), digits=3)}")
-        parts.append(f"improved {'yes' if payload.get('improved') else 'no'}")
-        self.add_event(" | ".join(parts), style="bold cyan")
-
     def add_event(self, message: str, *, style: str = "white", refresh: bool = True) -> None:
+        if not self.enabled:
+            return
         timestamp = datetime.now().strftime("%H:%M:%S")
         self.events.append((timestamp, message, style))
+        self.event_count += 1
+        with self.event_log_path.open("a", encoding="utf-8") as handle:
+            handle.write(f"{timestamp} {message}\n")
         self._update_log_panel()
         if refresh:
             self.refresh()
 
+    def update_status(
+        self,
+        *,
+        phase: str,
+        detail: str,
+        completed: int | float,
+        total: int | float,
+    ) -> None:
+        if not self.enabled:
+            return
+        self.phase = phase
+        self.detail = detail
+        self.progress_completed = float(max(completed, 0))
+        self.progress_total = float(max(total, 1))
+        self._update_overview_panel()
+        self._update_phase_panel()
+        self.refresh()
+
+    def record_snapshot(self, payload: dict[str, Any], *, phase: str, detail: str) -> None:
+        if not self.enabled:
+            return
+        self.latest_payload = payload
+        self.latest_evaluation = payload.get("evaluation")
+        self.current_step = int(payload.get("step", self.current_step))
+        self.phase = phase
+        self.detail = detail
+        self.progress_completed = float(self.current_step)
+        self.progress_total = float(self.total_steps)
+        self._append_history(payload)
+        self._update_all_panels()
+        self.refresh()
+
+    def record_evaluation(self, evaluation: dict[str, Any]) -> None:
+        if not self.enabled:
+            return
+        self.latest_evaluation = evaluation
+        candidate = evaluation["metrics"].get("candidate") or {}
+        baseline = evaluation["metrics"].get("baseline") or {}
+        self.add_event(
+            "evaluation done"
+            f" | cand rank {_format_float(candidate.get('average_rank'), digits=3)}"
+            f" | base rank {_format_float(baseline.get('average_rank'), digits=3)}"
+            f" | {'best updated' if evaluation.get('improved') else 'best kept'}",
+            style="green" if evaluation.get("improved") else "yellow",
+            refresh=False,
+        )
+        self._update_overview_panel()
+        self._update_metrics_panel()
+        self.refresh()
+
+    def finish(self, *, final_step: int) -> None:
+        if not self.enabled:
+            return
+        self.current_step = final_step
+        self.phase = "done"
+        self.detail = "training complete"
+        self.progress_completed = float(self.total_steps)
+        self.progress_total = float(self.total_steps)
+        self.add_event("training complete", style="bold green", refresh=False)
+        self._update_all_panels()
+        self.refresh()
+
+    def _append_history(self, payload: dict[str, Any]) -> None:
+        actors = payload.get("actors") or {}
+        inference = payload.get("inference") or {}
+        learner = payload.get("learner") or {}
+        self.history["step"].append(float(payload.get("step", 0)))
+        self.history["loss"].append(float(learner.get("loss", 0.0)))
+        self.history["decisions_per_sec"].append(float(actors.get("decisions_per_sec", 0.0)))
+        self.history["matches_per_sec"].append(float(actors.get("matches_per_sec", 0.0)))
+        self.history["avg_batch_size"].append(float(inference.get("avg_batch_size", 0.0)))
+        self.history["avg_inference_ms"].append(float(inference.get("avg_inference_ms", 0.0)))
+
     def _build_layout(self) -> Layout:
         layout = Layout(name="root")
         layout.split_column(
-            Layout(name="summary", size=11),
-            Layout(name="status", size=10),
+            Layout(name="summary", size=9),
+            Layout(name="log", size=11),
             Layout(name="charts", ratio=1),
         )
         layout["summary"].split_row(
-            Layout(name="overview"),
-            Layout(name="metrics"),
-        )
-        layout["status"].split_row(
-            Layout(name="progress", size=44),
-            Layout(name="log", ratio=1),
+            Layout(name="overview", ratio=6),
+            Layout(name="metrics", ratio=7),
+            Layout(name="phase", ratio=4),
         )
         layout["charts"].split_row(
             Layout(name="left"),
             Layout(name="right"),
         )
         layout["left"].split_column(
-            Layout(name="rank_chart"),
-            Layout(name="score_chart"),
+            Layout(name="throughput_chart"),
+            Layout(name="loss_chart"),
         )
         layout["right"].split_column(
-            Layout(name="loss_chart"),
-            Layout(name="entropy_chart"),
+            Layout(name="batch_chart"),
+            Layout(name="latency_chart"),
         )
         return layout
 
     def _update_all_panels(self) -> None:
         self._update_overview_panel()
         self._update_metrics_panel()
-        self._update_progress_panel()
+        self._update_phase_panel()
         self._update_log_panel()
         self._update_chart_panels()
 
@@ -337,268 +343,276 @@ class TrainingDashboard:
     def _update_metrics_panel(self) -> None:
         self.layout["metrics"].update(self._render_metrics())
 
-    def _update_progress_panel(self) -> None:
-        self.layout["progress"].update(self._render_progress())
+    def _update_phase_panel(self) -> None:
+        self.layout["phase"].update(self._render_phase())
 
     def _update_log_panel(self) -> None:
         self.layout["log"].update(self._render_event_log())
 
     def _update_chart_panels(self) -> None:
-        self.layout["rank_chart"].update(
+        self.layout["throughput_chart"].update(
             self._render_history_chart(
-                title="Rank Trend",
+                title="Throughput",
                 series=[
-                    ("candidate", self.history["candidate_rank"], "cyan"),
-                    ("baseline", self.history["baseline_rank"], "white"),
+                    ("d/s", self.history["decisions_per_sec"], "cyan"),
+                    ("m/s", self.history["matches_per_sec"], "green"),
                 ],
-                digits=3,
+                digits=2,
                 border_style="bright_cyan",
-                invert=True,
-                fixed_bounds=(1.0, 4.0),
-            )
-        )
-        self.layout["score_chart"].update(
-            self._render_history_chart(
-                title="Score Trend",
-                series=[
-                    ("candidate", self.history["candidate_score"], "green"),
-                    ("baseline", self.history["baseline_score"], "yellow"),
-                ],
-                digits=0,
-                border_style="green",
             )
         )
         self.layout["loss_chart"].update(
             self._render_history_chart(
-                title="Loss Trend",
+                title="Loss",
                 series=[("loss", self.history["loss"], "magenta")],
                 digits=4,
                 border_style="magenta",
             )
         )
-        self.layout["entropy_chart"].update(
+        self.layout["batch_chart"].update(
             self._render_history_chart(
-                title="Entropy Trend",
-                series=[("entropy", self.history["entropy"], "bright_yellow")],
-                digits=4,
+                title="Batch Size",
+                series=[("batch", self.history["avg_batch_size"], "yellow")],
+                digits=2,
                 border_style="yellow",
+            )
+        )
+        self.layout["latency_chart"].update(
+            self._render_history_chart(
+                title="Inference Ms",
+                series=[("ms", self.history["avg_inference_ms"], "red")],
+                digits=2,
+                border_style="red",
             )
         )
 
     def _render_overview(self) -> Panel:
-        table = Table.grid(expand=True, padding=(0, 2))
-        table.add_column(style="bold cyan")
-        table.add_column()
-        table.add_column(style="bold cyan")
-        table.add_column()
-        table.add_row("run", f"{self.run_iteration}/{self.total_iterations}", "step", str(self.checkpoint_step))
-        table.add_row("phase", self.phase, "device", self.device)
-        table.add_row("examples", str(self.examples) if self.examples else "-", "improved", self._format_improved())
-        table.add_row("checkpoint", self.checkpoint_path.name, "best", self.best_checkpoint_path.name)
-        table.add_row("metrics", self.metrics_path.name, "detail", self.detail)
-        return Panel(table, title="Training", border_style="blue")
+        elapsed = perf_counter() - self.started_at
+        table = Table.grid(expand=True, padding=(0, 1))
+        table.add_column(style="bold cyan", width=10)
+        table.add_column(no_wrap=True)
+        table.add_column(style="bold cyan", width=10)
+        table.add_column(no_wrap=True)
+        table.add_row("run", self.run_label, "phase", self.phase)
+        table.add_row("step", f"{self.current_step}/{self.total_steps}", "elapsed", _format_elapsed(elapsed))
+        table.add_row("learner", self.learner_device, "inference", self.inference_device)
+        table.add_row("actors", str(self.actor_processes), "warmup", str(self.warmup_steps))
+        table.add_row("ckpt", self.checkpoint_path.name, "best", self.best_checkpoint_path.name)
+        return Panel(table, title="Run", border_style="cyan")
 
     def _render_metrics(self) -> Panel:
-        table = Table(
-            show_header=True,
-            expand=True,
-            box=box.SIMPLE_HEAVY,
-            show_edge=False,
-            pad_edge=False,
+        if self.latest_payload is None:
+            placeholder = Align.left(Text("waiting for first learner snapshot", style="dim"))
+            return Panel(placeholder, title="Latest Metrics", border_style="green")
+
+        learner = self.latest_payload.get("learner") or {}
+        replay = self.latest_payload.get("replay") or {}
+        actors = self.latest_payload.get("actors") or {}
+        inference = self.latest_payload.get("inference") or {}
+        evaluation = self.latest_evaluation or {}
+        candidate = (evaluation.get("metrics") or {}).get("candidate") or {}
+        baseline = (evaluation.get("metrics") or {}).get("baseline") or {}
+
+        table = Table.grid(expand=True, padding=(0, 1))
+        for _ in range(6):
+            table.add_column()
+        table.add_row(
+            "loss",
+            _format_float(learner.get("loss")),
+            "policy",
+            _format_float(learner.get("policy_loss")),
+            "value",
+            _format_float(learner.get("value_loss")),
         )
-        table.add_column("metric", style="bold cyan")
-        table.add_column("candidate", justify="right")
-        table.add_column("baseline", justify="right")
-
-        selfplay_candidate = self.self_play_summary.get("candidate", {})
-        eval_candidate = self.evaluation_metrics.get("candidate", {})
-        eval_baseline = self.evaluation_metrics.get("baseline", {})
-
-        table.add_row("selfplay rank", _format_float(selfplay_candidate.get("average_rank"), digits=3), "-")
-        table.add_row("selfplay score", _format_float(selfplay_candidate.get("average_score"), digits=0), "-")
-        table.add_row("train loss", _format_float(self.train_metrics.get("loss")), "-")
-        table.add_row("train entropy", _format_float(self.train_metrics.get("entropy")), "-")
+        table.add_row(
+            "entropy",
+            _format_float(learner.get("entropy")),
+            "kl",
+            _format_float(learner.get("approx_kl")),
+            "grad",
+            _format_float(learner.get("grad_norm"), digits=3),
+        )
+        table.add_row(
+            "replay",
+            f"{int(replay.get('steps', 0))}/{int(replay.get('capacity', 0))}",
+            "fresh",
+            str(int(replay.get("fresh_steps", 0))),
+            "credit",
+            str(int(replay.get("growth_credit", 0))),
+        )
+        table.add_row(
+            "actor d/s",
+            _format_float(actors.get("decisions_per_sec"), digits=2),
+            "actor m/s",
+            _format_float(actors.get("matches_per_sec"), digits=2),
+            "actor total",
+            str(int(actors.get("decisions_total", 0))),
+        )
+        table.add_row(
+            "infer batch",
+            _format_float(inference.get("avg_batch_size"), digits=2),
+            "infer ms",
+            _format_float(inference.get("avg_inference_ms"), digits=2),
+            "max batch",
+            str(int(inference.get("max_batch_size", 0))),
+        )
         table.add_row(
             "eval rank",
-            _format_float(eval_candidate.get("average_rank"), digits=3),
-            _format_float(eval_baseline.get("average_rank"), digits=3),
-        )
-        table.add_row(
+            self._format_eval_metric(candidate, baseline, "average_rank", digits=3),
             "eval score",
-            _format_float(eval_candidate.get("average_score"), digits=0),
-            _format_float(eval_baseline.get("average_score"), digits=0),
-        )
-        table.add_row(
-            "top1 rate",
-            _format_pct(eval_candidate.get("top1_rate")),
-            _format_pct(eval_baseline.get("top1_rate")),
-        )
-        table.add_row(
-            "last rate",
-            _format_pct(eval_candidate.get("last_rate")),
-            _format_pct(eval_baseline.get("last_rate")),
+            self._format_eval_metric(candidate, baseline, "average_score", digits=0),
+            "best",
+            "updated" if evaluation.get("improved") else ("kept" if evaluation else "-"),
         )
         return Panel(table, title="Latest Metrics", border_style="green")
 
-    def _render_progress(self) -> Panel:
-        return Panel(self.progress, title="Phase Progress", border_style="cyan")
+    def _format_eval_metric(
+        self,
+        candidate: dict[str, Any],
+        baseline: dict[str, Any],
+        key: str,
+        *,
+        digits: int,
+    ) -> str:
+        candidate_text = _format_float(candidate.get(key), digits=digits)
+        if not baseline:
+            return candidate_text
+        return f"{candidate_text} / {_format_float(baseline.get(key), digits=digits)}"
+
+    def _render_phase(self) -> Panel:
+        pct = 100.0 * self.progress_completed / max(self.progress_total, 1.0)
+        pct = max(0.0, min(pct, 100.0))
+        table = Table.grid(expand=True, padding=(0, 1))
+        table.add_column(style="bold cyan")
+        table.add_column()
+        table.add_row("phase", self.phase)
+        table.add_row(
+            "progress",
+            f"{int(self.progress_completed)}/{int(self.progress_total)} ({pct:.1f}%)",
+        )
+        table.add_row("detail", self.detail)
+
+        bar_width = 20
+        filled = round(bar_width * pct / 100.0)
+        bar = Text("[", style="dim")
+        bar.append("=" * filled, style="bold cyan")
+        bar.append("-" * max(bar_width - filled, 0), style="grey35")
+        bar.append("]", style="dim")
+
+        return Panel(Group(table, bar), title="Phase", border_style="cyan")
 
     def _render_event_log(self) -> Panel:
         if not self.events:
-            return Panel(Align.left(Text("waiting for training events", style="dim")), title="Log", border_style="yellow")
+            placeholder = Align.left(Text("waiting for training events", style="dim"))
+            return Panel(placeholder, title="Recent Log", border_style="yellow")
 
         lines = []
-        for timestamp, message, style in self.events:
+        for timestamp, message, style in list(self.events)[-_VISIBLE_LOG_LINES:]:
             line = Text()
             line.append(timestamp, style="dim")
             line.append(" ")
             line.append(message, style=style)
             lines.append(line)
-        return Panel(Group(*lines), title="Log", border_style="yellow")
+        footer = Text(
+            f"showing {min(len(self.events), _VISIBLE_LOG_LINES)}/{self.event_count} events | "
+            f"full history: {self.event_log_path.name}",
+            style="dim",
+        )
+        return Panel(Group(*lines, footer), title="Recent Log", border_style="yellow")
 
     def _render_history_chart(
         self,
         *,
         title: str,
-        series: list[tuple[str, list[float], str]],
+        series: list[tuple[str, Sequence[float], str]],
         digits: int,
         border_style: str,
-        invert: bool = False,
-        fixed_bounds: tuple[float, float] | None = None,
     ) -> Panel:
-        trimmed_steps = _trim(self.history["step"])
-        trimmed_series = [
-            (name, _trim(values), color)
-            for name, values, color in series
-        ]
-
-        populated = [(name, values, color) for name, values, color in trimmed_series if values]
+        populated = [(name, _trim(values), color) for name, values, color in series if values]
         if not populated:
-            return Panel(
-                Align.center(Text("waiting for completed iteration", style="dim"), vertical="middle"),
-                title=title,
-                border_style=border_style,
-            )
+            placeholder = Align.left(Text("waiting for samples", style="dim"))
+            return Panel(placeholder, title=title, border_style=border_style)
 
-        all_values = [value for _, values, _ in populated for value in values]
-        low, high = fixed_bounds if fixed_bounds is not None else _padded_bounds(all_values)
+        trimmed_steps = _trim(self.history["step"])
+        bounds_source = [value for _, values, _ in populated for value in values]
+        lower, upper = _padded_bounds(bounds_source)
         lines = self._build_chart_lines(
             steps=trimmed_steps,
             series=populated,
-            low=low,
-            high=high,
+            lower=lower,
+            upper=upper,
             digits=digits,
-            invert=invert,
         )
 
-        legend = Text()
+        legends: list[Text] = []
         if trimmed_steps:
-            legend.append(f"steps {int(trimmed_steps[0])}->{int(trimmed_steps[-1])}", style="dim")
+            legends.append(Text(f"steps {int(trimmed_steps[0])}->{int(trimmed_steps[-1])}", style="dim"))
+        legend = Text()
         for index, (name, values, color) in enumerate(populated):
-            if index == 0 and trimmed_steps:
+            if index > 0:
                 legend.append("  ")
-            elif index > 0:
-                legend.append("  ")
-            legend.append("●", style=f"bold {color}")
-            legend.append(
-                f" {name} {_format_float(values[-1], digits=digits)}",
-                style="white",
-            )
-
-        return Panel(Group(*lines, legend), title=title, border_style=border_style)
+            legend.append("#", style=f"bold {color}")
+            legend.append(f" {name} {_format_float(values[-1], digits=digits)}")
+        legends.append(legend)
+        return Panel(Group(*lines, *legends), title=title, border_style=border_style)
 
     def _build_chart_lines(
         self,
         *,
-        steps: list[float],
-        series: list[tuple[str, list[float], str]],
-        low: float,
-        high: float,
+        steps: Sequence[float],
+        series: list[tuple[str, Sequence[float], str]],
+        lower: float,
+        upper: float,
         digits: int,
-        invert: bool,
     ) -> list[Text]:
-        width = _CHART_WIDTH
-        height = _CHART_HEIGHT
-        chars = [[" " for _ in range(width)] for _ in range(height)]
-        styles = [["white" for _ in range(width)] for _ in range(height)]
-        guide_rows = {0, height // 2, height - 1}
+        width = max(_CHART_WIDTH, 2)
+        height = max(_CHART_HEIGHT, 2)
+        grid = [[(" ", "") for _ in range(width)] for _ in range(height)]
 
-        for row in guide_rows:
-            for col in range(width):
-                chars[row][col] = "─"
-                styles[row][col] = "grey27"
+        def put_cell(x_pos: int, y_pos: int, char: str, style: str) -> None:
+            if 0 <= x_pos < width and 0 <= y_pos < height:
+                grid[y_pos][x_pos] = (char, style)
 
-        span = max(high - low, 1.0e-12)
-        point_count = max((len(values) for _, values, _ in series), default=0)
-
-        def x_for_index(index: int, count: int) -> int:
-            if count <= 1:
-                return width // 2
-            return round(index * (width - 1) / (count - 1))
-
-        def row_for_value(value: float) -> int:
-            normalized = (value - low) / span
-            if invert:
-                normalized = 1.0 - normalized
-            return _clamp(height - 1 - round(normalized * (height - 1)), 0, height - 1)
-
-        def put_cell(x: int, y: int, char: str, style: str) -> None:
-            current = chars[y][x]
-            if current == " " or current == "─":
-                chars[y][x] = char
-                styles[y][x] = style
-                return
-            if current == char and styles[y][x] == style:
-                return
-            chars[y][x] = "◉"
-            styles[y][x] = "bold white"
+        span = max(upper - lower, 1.0e-12)
+        step_count = max(len(steps), 1)
 
         for _, values, color in series:
-            count = len(values)
-            coordinates = [
-                (x_for_index(index, count), row_for_value(value))
-                for index, value in enumerate(values)
-            ]
+            coordinates: list[tuple[int, int]] = []
+            for index, value in enumerate(values):
+                if step_count == 1:
+                    x_pos = 0
+                else:
+                    x_pos = round(index * (width - 1) / max(len(values) - 1, 1))
+                normalized = (float(value) - lower) / span
+                y_pos = round((1.0 - normalized) * (height - 1))
+                coordinates.append((x_pos, _clamp(y_pos, 0, height - 1)))
+
             if len(coordinates) == 1:
-                x_pos, y_pos = coordinates[0]
-                put_cell(x_pos, y_pos, "●", f"bold {color}")
+                put_cell(coordinates[0][0], coordinates[0][1], "*", f"bold {color}")
                 continue
 
             for start, end in zip(coordinates, coordinates[1:]):
                 segment = _bresenham_points(start[0], start[1], end[0], end[1])
-                for point_index, (x_pos, y_pos) in enumerate(segment):
-                    endpoint = point_index == 0 or point_index == len(segment) - 1
-                    put_cell(x_pos, y_pos, "●" if endpoint else "•", f"bold {color}")
+                for point_index, (x_pos, y_pos) in enumerate(segment[:-1]):
+                    next_x, next_y = segment[point_index + 1]
+                    put_cell(x_pos, y_pos, _segment_char(x_pos, y_pos, next_x, next_y), f"bold {color}")
+                put_cell(segment[-1][0], segment[-1][1], "*", f"bold {color}")
 
         label_rows = {
-            0: high,
-            height // 2: (high + low) / 2.0,
-            height - 1: low,
+            0: upper,
+            height // 2: (lower + upper) / 2.0,
+            height - 1: lower,
         }
-
-        lines: list[Text] = []
-        for row in range(height):
-            label = _format_axis_label(label_rows[row], digits) if row in label_rows else ""
-            line = Text(f"{label:>9} ", style="dim")
-            line.append("┤" if row in guide_rows else "│", style="dim")
-            for col in range(width):
-                line.append(chars[row][col], style=styles[row][col])
-            lines.append(line)
-
-        axis = Text(" " * 10 + "└" + "─" * width, style="dim")
-        labels = Text(" " * 11, style="dim")
-        if steps:
-            left = str(int(steps[0]))
-            right = str(int(steps[-1]))
-            labels.append(left)
-            gap = max(width - len(left) - len(right), 1)
-            labels.append(" " * gap)
-            if len(steps) > 1:
-                labels.append(right)
-        lines.extend([axis, labels])
-        return lines
-
-    def _format_improved(self) -> str:
-        if self.improved is None:
-            return "-"
-        return "yes" if self.improved else "no"
+        rendered: list[Text] = []
+        for row_index, row in enumerate(grid):
+            label = label_rows.get(row_index)
+            line = Text()
+            if label is None:
+                line.append(" " * 7, style="dim")
+            else:
+                line.append(f"{_format_axis_label(label, digits):>7}", style="dim")
+            line.append(" ")
+            for char, style in row:
+                line.append(char, style=style)
+            rendered.append(line)
+        return rendered

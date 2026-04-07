@@ -3,10 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
-from mjai.bot import Bot
-from mjai.game import to_rank
 
 from bot import BasicMahjongBot
+from rust_mjai_bot import to_rank
 from train.training_config import RewardConfig
 
 
@@ -37,7 +36,7 @@ class SelfPlayBot(BasicMahjongBot):
         temperature: float = 1.0,
         deterministic: bool = False,
     ) -> None:
-        Bot.__init__(self, player_id=player_id)
+        super().__init__(player_id=player_id)
         self._policy_model = policy_model
         self._policy_device = next(policy_model.parameters()).device
         self._reward_config = reward_config
